@@ -1,0 +1,51 @@
+x-shard: &shard
+  build: .
+  restart: unless-stopped
+  command: ["uvicorn", "app.shard:create_app", "--factory", "--host", "0.0.0.0", "--port", "9000"]
+  depends_on: [coordinator]
+
+services:
+  coordinator:
+    build: .
+    restart: unless-stopped
+    ports: ["8000:8000"]
+    environment:
+      CATALOG_PATH: /data/catalog.json
+      VNODES: "128"
+    volumes: ["coordinator-data:/data"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://localhost:8000/health')"]
+      interval: 5s
+      retries: 10
+
+  shard1:
+    <<: *shard
+    environment: &shard-env
+      COORDINATOR_URL: http://coordinator:8000
+      DB_PATH: /data/shard.db
+      SHARD_ID: shard-1
+      PUBLIC_URL: http://shard1:9000
+    volumes: ["shard1-data:/data"]
+
+  shard2:
+    <<: *shard
+    environment:
+      <<: *shard-env
+      SHARD_ID: shard-2
+      PUBLIC_URL: http://shard2:9000
+    volumes: ["shard2-data:/data"]
+
+  shard3:
+    <<: *shard
+    profiles: ["scale"]
+    environment:
+      <<: *shard-env
+      SHARD_ID: shard-3
+      PUBLIC_URL: http://shard3:9000
+    volumes: ["shard3-data:/data"]
+
+volumes:
+  coordinator-data:
+  shard1-data:
+  shard2-data:
+  shard3-data:

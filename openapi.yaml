@@ -1,0 +1,439 @@
+openapi: 3.0.3
+info:
+  title: Shards Coordinator API
+  version: 1.0.0
+  description: |
+    Розподілене key-value сховище. Єдина публічна точка входу — координатор.
+    Він зберігає визначення таблиць, реєстр шардів і за consistent hashing
+    вирішує, на якому шарді лежить запис.
+
+    Ключ запису: `pk` (partition key, обовʼязковий) + `sk` (sort key).
+    `sk` потрібен тоді й лише тоді, коли в таблиці оголошено `sort_key`.
+    Усі помилки мають вигляд `{"detail": "..."}`.
+servers:
+  - url: http://localhost:8000
+
+tags:
+  - name: tables
+    description: Реєстрація визначень таблиць
+  - name: records
+    description: CRUD над записами
+  - name: cluster
+    description: Шарди, статистика, службові ендпоїнти
+
+paths:
+  /tables:
+    post:
+      tags: [tables]
+      summary: Зареєструвати визначення таблиці
+      operationId: createTable
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TableDef' }
+            example: { name: orders, partition_key: customer_id, sort_key: order_id }
+      responses:
+        '201':
+          description: Таблицю зареєстровано
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TableDef' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '409': { $ref: '#/components/responses/Conflict' }
+    get:
+      tags: [tables]
+      summary: Список таблиць
+      operationId: listTables
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/TableDef' }
+
+  /tables/{table}:
+    parameters:
+      - $ref: '#/components/parameters/Table'
+    get:
+      tags: [tables]
+      summary: Визначення таблиці
+      operationId: getTable
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TableDef' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /tables/{table}/records:
+    parameters:
+      - $ref: '#/components/parameters/Table'
+    post:
+      tags: [records]
+      summary: CREATE - покласти запис
+      description: Помилка 409, якщо запис із таким ключем уже існує.
+      operationId: createRecord
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RecordIn' }
+            example: { pk: c42, sk: o1001, value: { total: 99.5, status: new } }
+      responses:
+        '201':
+          description: Створено
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Record' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+    get:
+      tags: [records]
+      summary: READ - прочитати запис
+      operationId: readRecord
+      parameters:
+        - $ref: '#/components/parameters/Pk'
+        - $ref: '#/components/parameters/Sk'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Record' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+    put:
+      tags: [records]
+      summary: UPDATE - замінити значення існуючого запису
+      operationId: updateRecord
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RecordIn' }
+      responses:
+        '200':
+          description: Оновлено
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Record' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+    delete:
+      tags: [records]
+      summary: DELETE - видалити запис
+      operationId: deleteRecord
+      parameters:
+        - $ref: '#/components/parameters/Pk'
+        - $ref: '#/components/parameters/Sk'
+      responses:
+        '204': { description: Видалено }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+
+  /tables/{table}/records/exists:
+    parameters:
+      - $ref: '#/components/parameters/Table'
+    get:
+      tags: [records]
+      summary: EXISTS - чи є значення за ключем
+      operationId: recordExists
+      parameters:
+        - $ref: '#/components/parameters/Pk'
+        - $ref: '#/components/parameters/Sk'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [exists]
+                properties:
+                  exists: { type: boolean }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+
+  /tables/{table}/query:
+    parameters:
+      - $ref: '#/components/parameters/Table'
+    get:
+      tags: [records]
+      summary: Усі записи розділення, відсортовані за sort key
+      description: Лише для таблиць із sort key. Усі записи розділення лежать на одному шарді.
+      operationId: queryPartition
+      parameters:
+        - $ref: '#/components/parameters/Pk'
+        - name: sk_prefix
+          in: query
+          schema: { type: string, default: '' }
+          description: Повернути лише записи, чий sort key починається з цього префікса
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 1000, default: 100 }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/QueryResult' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+
+  /shards:
+    post:
+      tags: [cluster]
+      summary: Зареєструвати шард
+      description: |
+        Викликається самим шардом при старті (і періодично як heartbeat).
+        Якщо шард новий, координатор додає його в кільце й переносить на нього
+        ключі, що йому тепер належать; у відповіді - звіт про перенесення.
+      operationId: registerShard
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ShardIn' }
+            example: { id: shard-3, url: 'http://shard3:9000' }
+      responses:
+        '200':
+          description: Шард уже був зареєстрований
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ShardRegistration' }
+        '201':
+          description: Новий шард додано, дані перебалансовано
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ShardRegistration' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '500':
+          description: Шард додано, але rebalance не завершився (повторіть POST /rebalance)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+    get:
+      tags: [cluster]
+      summary: Список зареєстрованих шардів
+      operationId: listShards
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Shard' }
+
+  /rebalance:
+    post:
+      tags: [cluster]
+      summary: Перебалансувати дані вручну
+      operationId: rebalance
+      responses:
+        '200':
+          description: Звіт
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RebalanceReport' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+
+  /stats:
+    get:
+      tags: [cluster]
+      summary: Кількість записів на кожному шарді
+      operationId: stats
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Stats' }
+
+  /route:
+    get:
+      tags: [cluster]
+      summary: На який шард потрапить ключ
+      operationId: route
+      parameters:
+        - name: table
+          in: query
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/Pk'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  shard_id: { type: string }
+                  url: { type: string }
+                  hash: { type: integer, format: int64, description: 64-бітний хеш ключа }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+
+  /health:
+    get:
+      tags: [cluster]
+      summary: Liveness
+      operationId: health
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: ok }
+                  shards: { type: integer }
+                  tables: { type: integer }
+
+components:
+  parameters:
+    Table:
+      name: table
+      in: path
+      required: true
+      schema: { type: string }
+    Pk:
+      name: pk
+      in: query
+      required: true
+      description: Partition key. За його хешем обирається шард.
+      schema: { type: string, minLength: 1, maxLength: 512 }
+    Sk:
+      name: sk
+      in: query
+      required: false
+      description: Sort key. Обовʼязковий, якщо в таблиці оголошено sort_key; інакше заборонений.
+      schema: { type: string, minLength: 1, maxLength: 512 }
+
+  responses:
+    BadRequest:
+      description: Некоректний запит
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NotFound:
+      description: Таблицю або запис не знайдено
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Conflict:
+      description: Таблиця або запис уже існує
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Unavailable:
+      description: Шард недоступний або немає жодного шарда
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+  schemas:
+    Error:
+      type: object
+      required: [detail]
+      properties:
+        detail: { type: string }
+    TableDef:
+      type: object
+      required: [name, partition_key]
+      properties:
+        name:
+          type: string
+          pattern: '^[A-Za-z][A-Za-z0-9_]{0,63}$'
+        partition_key:
+          type: string
+          pattern: '^[A-Za-z][A-Za-z0-9_]{0,63}$'
+          description: Імʼя атрибута-ключа партиції
+        sort_key:
+          type: string
+          nullable: true
+          pattern: '^[A-Za-z][A-Za-z0-9_]{0,63}$'
+          description: Імʼя атрибута sort key (якщо потрібен складений ключ)
+    RecordIn:
+      type: object
+      required: [pk, value]
+      properties:
+        pk: { type: string, minLength: 1, maxLength: 512 }
+        sk: { type: string, nullable: true, minLength: 1, maxLength: 512 }
+        value: { description: Довільний JSON }
+    Record:
+      type: object
+      required: [table, pk, value]
+      properties:
+        table: { type: string }
+        pk: { type: string }
+        sk: { type: string, nullable: true }
+        value: { description: Довільний JSON }
+    QueryResult:
+      type: object
+      properties:
+        table: { type: string }
+        pk: { type: string }
+        items:
+          type: array
+          items:
+            type: object
+            properties:
+              sk: { type: string }
+              value: {}
+    Shard:
+      type: object
+      required: [id, url]
+      properties:
+        id: { type: string }
+        url: { type: string }
+    ShardIn:
+      type: object
+      required: [id, url]
+      properties:
+        id: { type: string, pattern: '^[A-Za-z0-9_.-]{1,64}$' }
+        url: { type: string, pattern: '^https?://\S+$' }
+    ShardRegistration:
+      type: object
+      properties:
+        shard: { $ref: '#/components/schemas/Shard' }
+        created: { type: boolean }
+        rebalance:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/RebalanceReport'
+    RebalanceReport:
+      type: object
+      properties:
+        scanned: { type: integer, description: Скільки записів переглянуто }
+        moved: { type: integer, description: Скільки записів переїхало на інший шард }
+        moved_fraction: { type: number }
+        moves:
+          type: object
+          additionalProperties: { type: integer }
+          example: { 'shard-1->shard-3': 340, 'shard-2->shard-3': 330 }
+    Stats:
+      type: object
+      properties:
+        total: { type: integer }
+        shards:
+          type: object
+          additionalProperties:
+            type: object
+            properties:
+              url: { type: string }
+              records: { type: integer, nullable: true }
